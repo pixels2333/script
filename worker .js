@@ -144,28 +144,56 @@ export default {
 
 
         // 规范化 JSON 对象中的 `prompt_cache_key`：
-        // - 如果客户端没传 / 传了空字符串，则统一置为 null
+        // - 第一次请求允许为 null（表示“不启用缓存键”）
+        // - 一旦客户端/插件提供了 key（header/query/body 任一来源），必须确保该 key 被注入到上游请求 body
+        //   否则你会看到“响应里的 key 一致”，但上游实际收到的 key 仍为 null/缺失，从而无法触发缓存命中。
         const hasKey =
           isObj && Object.prototype.hasOwnProperty.call(json, "prompt_cache_key");
         if (hasKey) requestHadPromptCacheKey = true;
-        const key = hasKey ? json.prompt_cache_key : undefined;
-        const isEmptyString =
-          typeof key === "string" && key.trim().length === 0;
-        const shouldNull = isObj && (!hasKey || key === null || key === undefined || isEmptyString);
 
-        if (shouldNull) {
-          json.prompt_cache_key = null;
-          if (hasKey) requestPromptCacheKey = null;
+        const bodyKeyRaw = hasKey ? json.prompt_cache_key : undefined;
+        const bodyKeyIsEmptyString =
+          typeof bodyKeyRaw === "string" && bodyKeyRaw.trim().length === 0;
+        const bodyKeyNormalized =
+          !hasKey || bodyKeyRaw === null || bodyKeyRaw === undefined || bodyKeyIsEmptyString
+            ? undefined
+            : bodyKeyRaw;
 
-          // 将修改后的 JSON 对象重新序列化为字符串，用于转发
+        // header/query 的值优先于 body（便于插件显式控制）
+        const effectiveKey =
+          requestPromptCacheKey !== null && requestPromptCacheKey !== undefined && String(requestPromptCacheKey).trim() !== ""
+            ? requestPromptCacheKey
+            : bodyKeyNormalized;
+
+        // 决定是否需要改写 body：
+        // - effectiveKey 有值：注入/覆写为该值
+        // - effectiveKey 无值：统一置为 null（让“无 key”的语义稳定）
+        const nextKey = effectiveKey === undefined ? null : effectiveKey;
+        const shouldRewriteKey = isObj && (json.prompt_cache_key !== nextKey);
+
+        if (isObj) {
+          if (effectiveKey === undefined) {
+            // 无论客户端是否显式带字段，统一为 null（第一次请求常见）
+            json.prompt_cache_key = null;
+          } else {
+            // 确保上游一定能收到非空 key
+            json.prompt_cache_key = effectiveKey;
+            requestHadPromptCacheKey = true;
+            requestPromptCacheKey = effectiveKey;
+          }
+        }
+
+        if (shouldRewriteKey) {
           body = JSON.stringify(json);
           processedText = body;
           if (isObj) processedObj = json;
-
-          // body 改写后，原 content-length 可能不再准确，删除让运行时自动计算。
           headers.delete("content-length");
         } else {
-          if (hasKey) requestPromptCacheKey = json.prompt_cache_key;
+          // 未发生改写时，也确保 response override 用到的 key 与请求体一致
+          if (effectiveKey !== undefined) {
+            requestHadPromptCacheKey = true;
+            requestPromptCacheKey = effectiveKey;
+          }
           processedText = originalText;
         }
       } catch {
